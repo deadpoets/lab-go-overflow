@@ -1,0 +1,85 @@
+name: patched-tree
+
+# Builds Go master at a pinned commit with patches/ applied, then runs
+# runtime/secret and the preemption-refusal probe. Several identical jobs,
+# because runner hardware varies and only some hosts have AVX-512 or AMX.
+
+on:
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: "Jobs per runner image"
+        default: "4"
+      base:
+        description: "go.googlesource.com/go commit to patch"
+        default: "8360c0d8c0c316d82e5ae873189be80052ed2b26"
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      idx: ${{ steps.m.outputs.idx }}
+    steps:
+      - id: m
+        run: echo "idx=$(seq -s, 1 ${{ inputs.runs }} | sed 's/^/[/;s/$/]/')" >> "$GITHUB_OUTPUT"
+
+  build-and-test:
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2025, windows-2022]
+        idx: ${{ fromJSON(needs.plan.outputs.idx) }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.x"
+          cache: false
+      - name: hardware
+        run: |
+          Get-CimInstance Win32_Processor | Select-Object Name, NumberOfLogicalProcessors | Format-List
+          [System.Environment]::OSVersion.VersionString
+          cd cpuinfo; go run .
+      - name: fetch go at base commit
+        run: |
+          git init go
+          cd go
+          git fetch --depth=1 https://go.googlesource.com/go ${{ inputs.base }}
+          git checkout -q FETCH_HEAD
+          git apply --stat ../patches/*.patch
+          git apply ../patches/*.patch
+      - name: make.bat
+        run: |
+          $env:GOROOT_BOOTSTRAP = (go env GOROOT)
+          cd go/src
+          .\make.bat
+      - name: runtime/secret tests
+        run: |
+          $env:GOEXPERIMENT = "runtimesecret"
+          cd go/src/runtime/secret
+          ..\..\..\bin\go.exe test -count=1 -v .
+      - name: preemption refusal probe
+        if: always()
+        run: |
+          $env:GOEXPERIMENT = "runtimesecret"
+          cd rsprobe
+          ..\go\bin\go.exe run .
+      - name: exception probe under patched runtime
+        if: always()
+        run: |
+          cd excprobe
+          ..\go\bin\go.exe run .
+      - name: runtime short tests
+        if: always()
+        run: |
+          cd go/src
+          ..\bin\go.exe test -short -count=1 runtime
