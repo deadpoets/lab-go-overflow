@@ -10,6 +10,7 @@ on:
 jobs:
   plan:
     runs-on: ubuntu-latest
+    timeout-minutes: 2
     outputs:
       idx: ${{ steps.m.outputs.idx }}
     steps:
@@ -24,6 +25,7 @@ jobs:
         os: [windows-2022, windows-2025]
         idx: ${{ fromJSON(needs.plan.outputs.idx) }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
     defaults:
       run:
         shell: pwsh
