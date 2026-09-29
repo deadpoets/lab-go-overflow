@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"runtime/debug"
 	"sync/atomic"
 	"unsafe"
 
@@ -54,6 +55,9 @@ var (
 )
 
 func main() {
+	// A suspended thread that holds a P and cannot be preempted would stall
+	// any stop-the-world. Keep the GC out of the way for this short program.
+	debug.SetGCPercent(-1)
 	var pat [32]byte
 	for i := range pat {
 		pat[i] = 0xa0 + byte(i)
@@ -147,15 +151,16 @@ func main() {
 			ymmh := unsafe.Slice((*byte)(unsafe.Pointer(p)), n)
 			expect("YMM5 upper half", ymmh[5*16:6*16], pat[16:32])
 		}
-		if cpu.X86.HasAVX512F {
-			fails += checkAVX512(en)
-		} else {
-			fmt.Println("Part 3: AVX-512 not present; skipped")
-		}
 	}
 
 	pResumeThread.Call(uintptr(h))
 	atomic.StoreUint32(&stop, 1)
+
+	if cpu.X86.HasAVX512F {
+		fails += checkAVX512(en)
+	} else {
+		fmt.Println("Part 3: AVX-512 not present; skipped")
+	}
 	if fails != 0 {
 		fmt.Printf("FAIL: %d mismatches\n", fails)
 		os.Exit(1)
