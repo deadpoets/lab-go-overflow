@@ -55,9 +55,9 @@ jobs:
           cd go
           git fetch --depth=1 https://go.googlesource.com/go ${{ inputs.base }}
           git checkout -q FETCH_HEAD
-          git apply --stat ../patches/*.patch
-          git apply ../patches/*.patch
+          Get-ChildItem ../patches/*.patch | ForEach-Object { git apply --stat $_.FullName; git apply $_.FullName; if ($LASTEXITCODE -ne 0) { exit 1 } }
       - name: make.bat
+        id: build
         run: |
           $env:GOROOT_BOOTSTRAP = (go env GOROOT)
           cd go/src
@@ -68,18 +68,18 @@ jobs:
           cd go/src/runtime/secret
           ..\..\..\bin\go.exe test -count=1 -v .
       - name: preemption refusal probe
-        if: always()
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: |
           $env:GOEXPERIMENT = "runtimesecret"
           cd rsprobe
           ..\go\bin\go.exe run .
       - name: exception probe under patched runtime
-        if: always()
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: |
           cd excprobe
           ..\go\bin\go.exe run .
       - name: runtime short tests
-        if: always()
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: |
           cd go/src
           ..\bin\go.exe test -short -count=1 runtime
