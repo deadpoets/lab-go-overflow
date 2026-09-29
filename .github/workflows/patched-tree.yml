@@ -13,6 +13,10 @@ on:
       base:
         description: "go.googlesource.com/go commit to patch"
         default: "8360c0d8c0c316d82e5ae873189be80052ed2b26"
+      apply_patch:
+        description: "Apply patches/ (false = test the base commit as is)"
+        type: boolean
+        default: true
 
 jobs:
   plan:
@@ -55,6 +59,7 @@ jobs:
           cd go
           git fetch --depth=1 https://go.googlesource.com/go ${{ inputs.base }}
           git checkout -q FETCH_HEAD
+          if ('${{ inputs.apply_patch }}' -eq 'false') { echo 'base commit, no patch'; exit 0 }
           Get-ChildItem ../patches/*.patch | ForEach-Object { git apply --stat $_.FullName; git apply $_.FullName; if ($LASTEXITCODE -ne 0) { exit 1 } }
       - name: make.bat
         id: build
@@ -63,6 +68,7 @@ jobs:
           cd go/src
           .\make.bat
       - name: runtime/secret tests
+        if: ${{ inputs.apply_patch }}
         run: |
           $env:GOEXPERIMENT = "runtimesecret"
           cd go/src/runtime/secret
