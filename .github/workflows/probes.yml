@@ -1,0 +1,51 @@
+name: probes
+
+on:
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: "Jobs per runner image (more jobs, more chances of AVX-512 hardware)"
+        default: "4"
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      idx: ${{ steps.m.outputs.idx }}
+    steps:
+      - id: m
+        run: echo "idx=$(seq -s, 1 ${{ inputs.runs }} | sed 's/^/[/;s/$/]/')" >> "$GITHUB_OUTPUT"
+
+  probe:
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
+        idx: ${{ fromJSON(needs.plan.outputs.idx) }}
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      GODEBUG: asyncpreemptoff=1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.x"
+          cache: false
+      - name: hardware
+        run: |
+          Get-CimInstance Win32_Processor | Select-Object Name, NumberOfLogicalProcessors | Format-List
+          [System.Environment]::OSVersion.VersionString
+          cd cpuinfo; go run .
+      - name: ctxprobe
+        if: always()
+        run: cd ctxprobe; go run .
+      - name: scanprobe
+        if: always()
+        run: cd scanprobe; go build -o scanprobe.exe .; ./scanprobe.exe
+      - name: excprobe
+        if: always()
+        run: cd excprobe; go run .
