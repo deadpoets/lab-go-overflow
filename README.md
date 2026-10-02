@@ -1,8 +1,8 @@
 # lab-go-overflow
 
-Private test bench for runtime/secret on windows/amd64. The probes are
-throwaway programs that settle factual claims. Nothing here goes into the Go
-tree as is; contributions go through Gerrit.
+Test bench for runtime/secret on windows/amd64 (golang/go#81796). The probes
+are throwaway programs that settle factual claims. Nothing here goes into the
+Go tree as is; contributions go through Gerrit.
 
 | Probe | Question |
 |---|---|
@@ -11,4 +11,14 @@ tree as is; contributions go through Gerrit.
 | `excprobe` | Where does Windows write the register state of a faulting goroutine? |
 | `gsignal` | Is `mp.gsignal` nil on Windows? Needs a Go source tree: `sh gsignal/run.sh <goroot>` |
 
-CI: Actions, "probes", run manually. Each job logs the CPU it landed on.
+| `excg0` | Does anything register-derived land on g0 during exception dispatch? `sh excg0/run.sh <goroot>` |
+| `rsprobe` | Is a call-free spin inside `secret.Do` preemptible? Needs `GOEXPERIMENT=runtimesecret` |
+
+`patches/` holds the work-in-progress runtime change that enables `secret.Do`
+on windows/amd64.
+
+CI (Actions, run manually; each job logs the CPU it landed on):
+
+- `probes`: runs the standalone probes.
+- `patched-tree`: builds Go at a pinned commit, with or without `patches/`,
+  then runs `runtime/secret`, the probes and `go test -short runtime`.
