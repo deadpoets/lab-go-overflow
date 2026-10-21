@@ -12,7 +12,7 @@ on:
         default: "4"
       base:
         description: "go.googlesource.com/go commit to patch"
-        default: "8360c0d8c0c316d82e5ae873189be80052ed2b26"
+        default: "05dbbf9175d021c5a61a69e3cc22abbd483d7fb0"
       apply_patch:
         description: "Apply patches/ (false = test the base commit as is)"
         type: boolean
