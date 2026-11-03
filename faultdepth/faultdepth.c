@@ -5,6 +5,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+// CONTEXT_EX is not in the public SDK headers. Layout from winnt.h / ntdll:
+// it follows the CONTEXT when CONTEXT_XSTATE is set.
+typedef struct { LONG Offset; DWORD Length; } ctx_chunk;
+typedef struct { ctx_chunk All, Legacy, XState; } ctx_ex;
+
 static volatile int which;
 
 static ULONG_PTR ctxsp(CONTEXT *c) {
@@ -24,7 +29,7 @@ static LONG CALLBACK handler(EXCEPTION_POINTERS *ep) {
 	ULONG_PTR here = (ULONG_PTR)&local;
 	DWORD all = 0, xs = 0;
 	if (c->ContextFlags & CONTEXT_XSTATE) {
-		CONTEXT_EX *ex = (CONTEXT_EX *)(c + 1);
+		ctx_ex *ex = (ctx_ex *)(c + 1);
 		all = ex->All.Length;
 		xs = ex->XState.Length;
 	}
