@@ -1,0 +1,32 @@
+name: ctxsize
+
+# InitializeContext size and errno per ContextFlags value, on amd64 and arm64
+# Windows kernels. Settles what the "unsupported XSTATE" error looks like.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  ctxsize:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-11-arm, windows-2025, windows-2022]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.x"
+          cache: false
+      - name: hardware
+        run: |
+          Get-CimInstance Win32_Processor | Select-Object Name, Architecture, NumberOfLogicalProcessors | Format-List
+          [System.Environment]::OSVersion.VersionString
+          go version
+      - name: ctxsize
+        run: cd ctxsize; go run .
