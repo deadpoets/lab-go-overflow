@@ -1,0 +1,42 @@
+name: faultdepth
+
+# C vectored handler: distance from the faulting SP to the first user-mode
+# handler frame, and the CONTEXT_EX length, on amd64 and arm64 kernels.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  faultdepth:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-11-arm
+            arch: arm64
+          - os: windows-2025
+            arch: x64
+          - os: windows-2022
+            arch: x64
+          - os: windows-2025
+            arch: x86
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.arch }}
+      - name: hardware
+        run: |
+          Get-CimInstance Win32_Processor | Select-Object Name | Format-List
+          [System.Environment]::OSVersion.VersionString
+      - name: build and run
+        run: |
+          cd faultdepth
+          cl /nologo /W3 /O2 faultdepth.c /link kernel32.lib
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          for ($i = 0; $i -lt 3; $i++) { .\faultdepth.exe; "exit=$LASTEXITCODE" }
