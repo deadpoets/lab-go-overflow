@@ -1,0 +1,91 @@
+name: patched-tree-81238
+
+# Builds Go master at a pinned commit with patches-81238/ applied (Go CL
+# 828724, the exception stack reserve fix for golang/go#81238), then runs the
+# runtime tests it adds and the short runtime suite. Several identical jobs
+# per image, because runner hardware varies and only some hosts have AVX-512
+# or AMX; windows-11-arm exercises the arm64 CONTEXT_XSTATE path on SVE.
+
+on:
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: "Jobs per runner image"
+        default: "4"
+      base:
+        description: "go.googlesource.com/go commit to patch"
+        default: "165bc6e7b86782c04ed7475199fe093b2f0f22fc"
+      apply_patch:
+        description: "Apply patches-81238/ (false = test the base commit as is)"
+        type: boolean
+        default: true
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      idx: ${{ steps.m.outputs.idx }}
+    steps:
+      - id: m
+        run: echo "idx=$(seq -s, 1 ${{ inputs.runs }} | sed 's/^/[/;s/$/]/')" >> "$GITHUB_OUTPUT"
+
+  build-and-test:
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2025, windows-2022, windows-11-arm]
+        idx: ${{ fromJSON(needs.plan.outputs.idx) }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.x"
+          cache: false
+      - name: hardware
+        run: |
+          Get-CimInstance Win32_Processor | Select-Object Name, Architecture, NumberOfLogicalProcessors | Format-List
+          [System.Environment]::OSVersion.VersionString
+          go version
+          cd cpuinfo; go run .
+      - name: fetch go at base commit
+        run: |
+          git init go
+          cd go
+          git fetch --depth=1 https://go.googlesource.com/go ${{ inputs.base }}
+          git checkout -q FETCH_HEAD
+          if ('${{ inputs.apply_patch }}' -eq 'false') { echo 'base commit, no patch'; exit 0 }
+          $p = '../patches-81238/0001-runtime-size-the-Windows-exception-stack-reserve.patch'
+          git apply --stat $p
+          git apply $p
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+      - name: make.bat
+        id: build
+        run: |
+          $env:GOROOT_BOOTSTRAP = (go env GOROOT)
+          cd go/src
+          .\make.bat
+      - name: exception reserve tests
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          cd go/src
+          ..\bin\go.exe test -count=1 -v -run 'Exception|G0Stack|Vectored' runtime
+      - name: exception probe under patched runtime
+        # amd64 assembly only.
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && matrix.os != 'windows-11-arm' }}
+        run: |
+          cd excprobe
+          ..\go\bin\go.exe run .
+      - name: runtime short tests
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          cd go/src
+          ..\bin\go.exe test -short -count=1 runtime
