@@ -1,4 +1,4 @@
-From 40df50059e4d36325ff805e0df61f7d9c624f5c9 Mon Sep 17 00:00:00 2001
+From cde17b579e7430ef318bcccf2251063949e0f738 Mon Sep 17 00:00:00 2001
 From: Chris Fink <chris@cxjxf.com>
 Date: Mon, 7 Sep 2026 07:44:09 -0400
 Subject: [PATCH] runtime: size the Windows exception stack reserve from the
@@ -23,16 +23,11 @@ reports the size the kernel will push for this host, so osinit reserves
 that plus 2048 bytes for the exception record, the kernel's alignment,
 and the dispatcher frames below the CONTEXT (up to 1087 bytes measured,
 on arm64). The minimum stack allocation and a Go-computed guard distance
-move with the reserve. Those three values are constants everywhere but
-Windows, so no other platform's code changes. The compile-time stackGuard
-still applies where the assembly bootstraps g0 before mstart0 and minit
-replace its guard, and in the linker's nosplit check, which assumes only
-that floor. Hosts whose need is below the floor are unchanged; AVX-512
-hosts keep 8 KiB minimum stacks with a larger guard; AMX hosts get
-16 KiB minimum stacks, which leave about 1.8 KiB for Go frames before
-the first growth, and their 32 KiB stacks come from the large-stack
-allocator, since the per-P stack cache on 64-bit Windows covers only
-8 and 16 KiB.
+move with the reserve. The compile-time stackGuard still applies where
+the assembly bootstraps g0 before mstart0 and minit replace its guard,
+and in the linker's nosplit check, which assumes only that floor. Hosts
+whose need is below the floor are unchanged; AVX-512 hosts keep 8 KiB
+minimum stacks with a larger guard; AMX hosts get 16 KiB minimum stacks.
 
 The frame size is a property of the boot-time XSTATE mask: measured on
 the affected hosts, a hardware fault's frame already includes the AMX
@@ -56,10 +51,6 @@ forces a reserve and checks shrinkstack never leaves less than it below
 SP, so that coverage does not depend on the builder's CPU having AMX.
 Both fail if no shrink happened, rather than passing vacuously.
 
-Validated on 40 fresh windows-2025 runners: every AMX host failed the
-reproducer under stock tip with "exception dispatched below goroutine
-stack bottom" and passed with this change; non-AMX hosts passed both.
-
 Fixes #81238
 
 Change-Id: I46051a7d94205f85193615c2e37a29d5c025f67a
@@ -77,12 +68,8 @@ Change-Id: I46051a7d94205f85193615c2e37a29d5c025f67a
  src/runtime/signal_unix.go                    |   4 +-
  src/runtime/signal_windows.go                 |   2 +-
  src/runtime/signal_windows_test.go            | 232 ++++++++++++++++++
- src/runtime/stack.go                          |  36 ++-
- src/runtime/stack_reserve_other.go            |  17 ++
- src/runtime/stack_reserve_windows.go          |  51 ++++
- 16 files changed, 476 insertions(+), 33 deletions(-)
- create mode 100644 src/runtime/stack_reserve_other.go
- create mode 100644 src/runtime/stack_reserve_windows.go
+ src/runtime/stack.go                          |  76 +++++-
+ 14 files changed, 448 insertions(+), 33 deletions(-)
 
 diff --git a/src/internal/runtime/syscall/windows/defs_windows.go b/src/internal/runtime/syscall/windows/defs_windows.go
 index 4170784ec2..b6fa1bb4b9 100644
@@ -730,154 +717,24 @@ index 96e47480d7..63167192f2 100644
 +	return faulted
 +}
 diff --git a/src/runtime/stack.go b/src/runtime/stack.go
-index 097b20735b..c71999265a 100644
+index 097b20735b..0d3c6dc473 100644
 --- a/src/runtime/stack.go
 +++ b/src/runtime/stack.go
-@@ -102,6 +102,11 @@ const (
+@@ -102,6 +102,51 @@ const (
  	stackGuard = stackNosplit + stackSystem + abi.StackSmall
  )
  
-+// The values in force are stackSystemReserve, stackGuardSize and
-+// stackMinAlloc, defined in stack_reserve_*.go. They are the constants
-+// above everywhere except on Windows, where they are raised at startup
-+// to what the host's exception dispatch needs.
-+
- const (
- 	// stackDebug == 0: no logging
- 	//            == 1: logging of per-stack operations
-@@ -996,7 +1001,7 @@ func copystack(gp *g, newsize uintptr) {
- 
- 	// Swap out old stack for new one
- 	gp.stack = new
--	gp.stackguard0 = new.lo + stackGuard // NOTE: might clobber a preempt request
-+	gp.stackguard0 = new.lo + stackGuardSize // NOTE: might clobber a preempt request
- 	gp.sched.sp = new.hi - used
- 	gp.stktopsp += adjinfo.delta
- 
-@@ -1124,7 +1129,7 @@ func newstack() {
- 		if !canPreemptM(thisg.m) {
- 			// Let the goroutine keep running for now.
- 			// gp->preempt is set, so it will be preempted next time.
--			gp.stackguard0 = gp.stack.lo + stackGuard
-+			gp.stackguard0 = gp.stack.lo + stackGuardSize
- 			gogo(&gp.sched) // never return
- 		}
- 	}
-@@ -1183,7 +1188,7 @@ func newstack() {
- 	// recheck the bounds on return.)
- 	if f := findfunc(gp.sched.pc); f.valid() {
- 		max := uintptr(funcMaxSPDelta(f))
--		needed := max + stackGuard
-+		needed := max + stackGuardSize
- 		used := gp.stack.hi - gp.sched.sp
- 		for newsize-used < needed {
- 			newsize *= 2
-@@ -1314,7 +1319,7 @@ func shrinkstack(gp *g) {
- 	newsize := oldsize / 2
- 	// Don't shrink the allocation below the minimum-sized stack
- 	// allocation.
--	if newsize < fixedStack {
-+	if newsize < uintptr(stackMinAlloc) {
- 		return
- 	}
- 	// Compute how much of the stack is currently in use and only
-@@ -1323,7 +1328,16 @@ func shrinkstack(gp *g) {
- 	// down to the SP plus the stack guard space that ensures
- 	// there's room for nosplit functions.
- 	avail := gp.stack.hi - gp.stack.lo
--	if used := gp.stack.hi - gp.sched.sp + stackNosplit; used >= avail/4 {
-+	used := gp.stack.hi - gp.sched.sp
-+	if used+stackNosplit >= avail/4 {
-+		return
-+	}
-+	// The OS reserve must also still fit below the live frames on the
-+	// smaller stack. stackMinAlloc only guarantees that for a nearly empty
-+	// stack; a goroutine shrunk with more live frames than that could
-+	// resume with less headroom than the reserve promises and take an
-+	// exception before its next stack check. See #81238.
-+	if newsize-used < stackNosplit+stackSystemReserve {
- 		return
- 	}
- 
-@@ -1413,7 +1427,7 @@ func morestackc() {
- }
- 
- // startingStackSize is the amount of stack that new goroutines start with.
--// It is a power of 2, and between fixedStack and maxstacksize, inclusive.
-+// It is a power of 2, and between stackMinAlloc and maxstacksize, inclusive.
- // startingStackSize is updated every GC by tracking the average size of
- // stacks scanned during the GC.
- var startingStackSize uint32 = fixedStack
-@@ -1442,17 +1456,17 @@ func gcComputeStartingStackSize() {
- 		p.scannedStacks = 0
- 	}
- 	if scannedStacks == 0 {
--		startingStackSize = fixedStack
-+		startingStackSize = stackMinAlloc
- 		return
- 	}
--	avg := scannedStackSize/scannedStacks + stackGuard
--	// Note: we add stackGuard to ensure that a goroutine that
-+	avg := scannedStackSize/scannedStacks + uint64(stackGuardSize)
-+	// Note: we add stackGuardSize to ensure that a goroutine that
- 	// uses the average space will not trigger a growth.
- 	if avg > uint64(maxstacksize) {
- 		avg = uint64(maxstacksize)
- 	}
--	if avg < fixedStack {
--		avg = fixedStack
-+	if avg < uint64(stackMinAlloc) {
-+		avg = uint64(stackMinAlloc)
- 	}
- 	// Note: maxstacksize fits in 30 bits, so avg also does.
- 	startingStackSize = uint32(round2(int32(avg)))
-diff --git a/src/runtime/stack_reserve_other.go b/src/runtime/stack_reserve_other.go
-new file mode 100644
-index 0000000000..bcc109b519
---- /dev/null
-+++ b/src/runtime/stack_reserve_other.go
-@@ -0,0 +1,17 @@
-+// Copyright 2026 The Go Authors. All rights reserved.
-+// Use of this source code is governed by a BSD-style
-+// license that can be found in the LICENSE file.
-+
-+//go:build !windows
-+
-+package runtime
-+
-+// The OS reserve below every goroutine stack, the stack guard distance and
-+// the minimum stack allocation, in force. Everywhere but Windows they are
-+// the compile-time values; see stack_reserve_windows.go for why Windows
-+// cannot use those.
-+const (
-+	stackSystemReserve = stackSystem
-+	stackGuardSize     = stackGuard
-+	stackMinAlloc      = fixedStack
-+)
-diff --git a/src/runtime/stack_reserve_windows.go b/src/runtime/stack_reserve_windows.go
-new file mode 100644
-index 0000000000..e7245deec9
---- /dev/null
-+++ b/src/runtime/stack_reserve_windows.go
-@@ -0,0 +1,51 @@
-+// Copyright 2026 The Go Authors. All rights reserved.
-+// Use of this source code is governed by a BSD-style
-+// license that can be found in the LICENSE file.
-+
-+package runtime
-+
-+import "internal/abi"
-+
 +// The OS reserve below every goroutine stack, the stack guard distance and
 +// the minimum stack allocation, in force.
 +//
-+// Windows needs more room below a goroutine's stack than stackSystem grants
-+// on some hosts, and how much is only known at run time: the kernel
-+// dispatches every exception on the faulting goroutine's own stack, pushing
-+// a CONTEXT whose size depends on the CPU's extended register state (see
-+// exceptionStackReserve in os_windows.go). So here these are variables.
 +// They start at the compile-time floors (stackSystem, stackGuard and
-+// fixedStack) and are raised once, from osinit, by setStackSystemReserve.
++// fixedStack) and may be raised once, before any goroutine stack is
++// allocated, by setStackSystemReserve: some systems need more room below a
++// goroutine's stack than stackSystem grants, and how much is only known at
++// run time. Windows is one: the kernel dispatches every exception on the
++// faulting goroutine's own stack, pushing a CONTEXT whose size depends on
++// the CPU's extended register state (see exceptionStackReserve in
++// os_windows.go).
 +//
 +// The compile-time stackGuard still applies in two places. The assembly
 +// that bootstraps g0 (rt0_go and the thread entry points) sets its guard
@@ -911,6 +768,96 @@ index 0000000000..e7245deec9
 +	stackMinAlloc = uint32(round2(int32(stackMin + n)))
 +	startingStackSize = stackMinAlloc
 +}
++
+ const (
+ 	// stackDebug == 0: no logging
+ 	//            == 1: logging of per-stack operations
+@@ -996,7 +1041,7 @@ func copystack(gp *g, newsize uintptr) {
+ 
+ 	// Swap out old stack for new one
+ 	gp.stack = new
+-	gp.stackguard0 = new.lo + stackGuard // NOTE: might clobber a preempt request
++	gp.stackguard0 = new.lo + stackGuardSize // NOTE: might clobber a preempt request
+ 	gp.sched.sp = new.hi - used
+ 	gp.stktopsp += adjinfo.delta
+ 
+@@ -1124,7 +1169,7 @@ func newstack() {
+ 		if !canPreemptM(thisg.m) {
+ 			// Let the goroutine keep running for now.
+ 			// gp->preempt is set, so it will be preempted next time.
+-			gp.stackguard0 = gp.stack.lo + stackGuard
++			gp.stackguard0 = gp.stack.lo + stackGuardSize
+ 			gogo(&gp.sched) // never return
+ 		}
+ 	}
+@@ -1183,7 +1228,7 @@ func newstack() {
+ 	// recheck the bounds on return.)
+ 	if f := findfunc(gp.sched.pc); f.valid() {
+ 		max := uintptr(funcMaxSPDelta(f))
+-		needed := max + stackGuard
++		needed := max + stackGuardSize
+ 		used := gp.stack.hi - gp.sched.sp
+ 		for newsize-used < needed {
+ 			newsize *= 2
+@@ -1314,7 +1359,7 @@ func shrinkstack(gp *g) {
+ 	newsize := oldsize / 2
+ 	// Don't shrink the allocation below the minimum-sized stack
+ 	// allocation.
+-	if newsize < fixedStack {
++	if newsize < uintptr(stackMinAlloc) {
+ 		return
+ 	}
+ 	// Compute how much of the stack is currently in use and only
+@@ -1323,7 +1368,16 @@ func shrinkstack(gp *g) {
+ 	// down to the SP plus the stack guard space that ensures
+ 	// there's room for nosplit functions.
+ 	avail := gp.stack.hi - gp.stack.lo
+-	if used := gp.stack.hi - gp.sched.sp + stackNosplit; used >= avail/4 {
++	used := gp.stack.hi - gp.sched.sp
++	if used+stackNosplit >= avail/4 {
++		return
++	}
++	// The OS reserve must also still fit below the live frames on the
++	// smaller stack. stackMinAlloc only guarantees that for a nearly empty
++	// stack; a goroutine shrunk with more live frames than that could
++	// resume with less headroom than the reserve promises and take an
++	// exception before its next stack check. See #81238.
++	if newsize-used < stackNosplit+stackSystemReserve {
+ 		return
+ 	}
+ 
+@@ -1413,7 +1467,7 @@ func morestackc() {
+ }
+ 
+ // startingStackSize is the amount of stack that new goroutines start with.
+-// It is a power of 2, and between fixedStack and maxstacksize, inclusive.
++// It is a power of 2, and between stackMinAlloc and maxstacksize, inclusive.
+ // startingStackSize is updated every GC by tracking the average size of
+ // stacks scanned during the GC.
+ var startingStackSize uint32 = fixedStack
+@@ -1442,17 +1496,17 @@ func gcComputeStartingStackSize() {
+ 		p.scannedStacks = 0
+ 	}
+ 	if scannedStacks == 0 {
+-		startingStackSize = fixedStack
++		startingStackSize = stackMinAlloc
+ 		return
+ 	}
+-	avg := scannedStackSize/scannedStacks + stackGuard
+-	// Note: we add stackGuard to ensure that a goroutine that
++	avg := scannedStackSize/scannedStacks + uint64(stackGuardSize)
++	// Note: we add stackGuardSize to ensure that a goroutine that
+ 	// uses the average space will not trigger a growth.
+ 	if avg > uint64(maxstacksize) {
+ 		avg = uint64(maxstacksize)
+ 	}
+-	if avg < fixedStack {
+-		avg = fixedStack
++	if avg < uint64(stackMinAlloc) {
++		avg = uint64(stackMinAlloc)
+ 	}
+ 	// Note: maxstacksize fits in 30 bits, so avg also does.
+ 	startingStackSize = uint32(round2(int32(avg)))
 -- 
 2.54.0.windows.1
 
