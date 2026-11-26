@@ -170,7 +170,9 @@ jobs:
           $pass = 0; $fail = 0; $hang = 0
           for ($i = 1; $i -le [int]$env:LOOPS; $i++) {
             $psi = [System.Diagnostics.ProcessStartInfo]::new('gdb')
-            foreach ($a in $gdbargs) { $psi.ArgumentList.Add($a) }
+            # gdbArgsFixup: this gdb re-splits its arguments, so ones with
+            # spaces carry their own double quotes.
+            foreach ($a in $gdbargs) { if ($a.Contains(' ')) { $a = '"' + $a + '"' }; $psi.ArgumentList.Add($a) }
             $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.UseShellExecute = $false
             $t0 = Get-Date
             $p = [System.Diagnostics.Process]::Start($psi)
