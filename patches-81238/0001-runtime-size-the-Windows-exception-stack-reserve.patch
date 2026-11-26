@@ -1,4 +1,4 @@
-From 4341618f54c0bdf6f632d730431509302304c765 Mon Sep 17 00:00:00 2001
+From ced133727e92268c72602cb4e545d5d8abf4f183 Mon Sep 17 00:00:00 2001
 From: Chris Fink <chris@cxjxf.com>
 Date: Mon, 7 Sep 2026 07:44:09 -0400
 Subject: [PATCH] runtime: size the Windows exception stack reserve from the
@@ -15,8 +15,9 @@ heap.
 Make stackSystem, stackGuard and fixedStack variables. On Windows,
 osinit sets stackSystem to the CONTEXT size InitializeContext reports
 plus 2 KiB for the rest of the dispatch, and never below the old 4 KiB.
-Assembly that sets up g0 uses the compile-time stackGuardStatic until
-mstart0 or minit sets the guard.
+Assembly can only read constants, so the code that sets up g0 reads
+stackGuardStatic, which has the old stackGuard value. The assembled code
+does not change.
 
 shrinkstack also refuses to leave less than stackSystem below SP.
 
@@ -39,11 +40,11 @@ Change-Id: I46051a7d94205f85193615c2e37a29d5c025f67a
  src/runtime/asm_riscv64.s                     |   2 +-
  src/runtime/asm_s390x.s                       |   2 +-
  src/runtime/export_windows_test.go            |  40 ++++
- src/runtime/os_windows.go                     |  45 ++++
+ src/runtime/os_windows.go                     |  44 ++++
  src/runtime/proc.go                           |   2 +-
  src/runtime/runtime1.go                       |   2 +-
  src/runtime/signal_windows_test.go            | 199 ++++++++++++++++++
- src/runtime/stack.go                          |  68 ++++--
+ src/runtime/stack.go                          |  69 ++++--
  src/runtime/sys_aix_ppc64.s                   |   2 +-
  src/runtime/sys_solaris_amd64.s               |   2 +-
  src/runtime/sys_windows_386.s                 |   2 +-
@@ -304,7 +305,7 @@ index f44e24bbac..dce34342de 100644
 +	return gp.stack.hi - gp.stack.lo
 +}
 diff --git a/src/runtime/os_windows.go b/src/runtime/os_windows.go
-index 59ca989f1d..0e34ab8572 100644
+index 59ca989f1d..19124e8ab0 100644
 --- a/src/runtime/os_windows.go
 +++ b/src/runtime/os_windows.go
 @@ -39,6 +39,7 @@ const (
@@ -323,17 +324,16 @@ index 59ca989f1d..0e34ab8572 100644
  	_IsProcessorFeaturePresent,
  	_SetThreadContext,
  	_LoadLibraryExW,
-@@ -485,6 +487,9 @@ func osinit() {
+@@ -485,6 +487,8 @@ func osinit() {
  	preventErrorDialogs()
  
  	initExceptionHandler()
-+	// Never below the 4 KiB Windows has always reserved, so hosts that
-+	// need less are unchanged.
-+	setStackSystem(max(exceptionStackReserve(), 4096))
++	// Never below the static reserve, so hosts that need less are unchanged.
++	setStackSystem(max(exceptionStackReserve(), stackSystemStatic))
  
  	initHighResTimer()
  	timeBeginPeriodRetValue = osRelax(false)
-@@ -503,6 +508,46 @@ func osinit() {
+@@ -503,6 +507,46 @@ func osinit() {
  	stdcall(_SetProcessPriorityBoost, windows.CurrentProcess, 1)
  }
  
@@ -344,8 +344,8 @@ index 59ca989f1d..0e34ab8572 100644
 +// over 11 KiB with AMX. See issue 81238.
 +func exceptionStackReserve() uintptr {
 +	// The EXCEPTION_RECORD, the kernel's alignment, and the frames below
-+	// the CONTEXT until sigtrampgo switches to g0. Measured up to sigtramp
-+	// at up to 913 bytes on amd64, 1087 on arm64 and 309 on 386.
++	// the CONTEXT until sigtrampgo switches to g0. Before sigtramp these
++	// measure up to 913 bytes on amd64, 1087 on arm64 and 309 on 386.
 +	const dispatchOverhead = 2048
 +
 +	n, errno := initializeContextSize(windows.CONTEXT_ALL | windows.CONTEXT_XSTATE)
@@ -627,10 +627,10 @@ index 96e47480d7..7beaa1ddc5 100644
 +	return faulted
 +}
 diff --git a/src/runtime/stack.go b/src/runtime/stack.go
-index 2d5b87ce2e..1972ed00f1 100644
+index 2d5b87ce2e..aefccff693 100644
 --- a/src/runtime/stack.go
 +++ b/src/runtime/stack.go
-@@ -68,40 +68,62 @@ functions to make sure that this limit cannot be violated.
+@@ -68,40 +68,63 @@ functions to make sure that this limit cannot be violated.
  */
  
  const (
@@ -640,7 +640,8 @@ index 2d5b87ce2e..1972ed00f1 100644
 -	// and iOS because they do not use a separate stack.
 -	stackSystem = goos.IsWindows*4096 + goos.IsPlan9*512 + goos.IsIos*goarch.IsArm64*1024
 +	// stackSystemStatic is the part of stackSystem known at compile time.
-+	stackSystemStatic = goos.IsPlan9*512 + goos.IsIos*goarch.IsArm64*1024
++	// On Windows it is a floor: osinit may raise stackSystem above it.
++	stackSystemStatic = goos.IsWindows*4096 + goos.IsPlan9*512 + goos.IsIos*goarch.IsArm64*1024
  
  	// The minimum size of stack used by Go code
  	stackMin = 2048
@@ -702,7 +703,7 @@ index 2d5b87ce2e..1972ed00f1 100644
  const (
  	// stackDebug == 0: no logging
  	//            == 1: logging of per-stack operations
-@@ -208,7 +230,7 @@ func stackpoolalloc(order uint8) gclinkptr {
+@@ -208,7 +231,7 @@ func stackpoolalloc(order uint8) gclinkptr {
  			throw("bad manualFreeList")
  		}
  		osStackAlloc(s)
@@ -711,7 +712,7 @@ index 2d5b87ce2e..1972ed00f1 100644
  		for i := uintptr(0); i < _StackCacheSize; i += s.elemsize {
  			x := gclinkptr(s.base() + i)
  			if valgrindenabled {
-@@ -290,7 +312,7 @@ func stackcacherefill(c *mcache, order uint8) {
+@@ -290,7 +313,7 @@ func stackcacherefill(c *mcache, order uint8) {
  		x := stackpoolalloc(order)
  		x.ptr().next = list
  		list = x
@@ -720,7 +721,7 @@ index 2d5b87ce2e..1972ed00f1 100644
  	}
  	unlock(&stackpool[order].item.mu)
  	c.stackcache[order].list = list
-@@ -309,7 +331,7 @@ func stackcacherelease(c *mcache, order uint8) {
+@@ -309,7 +332,7 @@ func stackcacherelease(c *mcache, order uint8) {
  		y := x.ptr().next
  		stackpoolfree(x, order)
  		x = y
@@ -729,7 +730,7 @@ index 2d5b87ce2e..1972ed00f1 100644
  	}
  	unlock(&stackpool[order].item.mu)
  	c.stackcache[order].list = x
-@@ -498,10 +520,10 @@ func stackfree(stk stack) {
+@@ -498,10 +521,10 @@ func stackfree(stk stack) {
  	if valgrindenabled {
  		valgrindFree(v)
  	}
@@ -742,7 +743,7 @@ index 2d5b87ce2e..1972ed00f1 100644
  			order++
  			n2 >>= 1
  		}
-@@ -1339,7 +1361,7 @@ func shrinkstack(gp *g) {
+@@ -1339,7 +1362,7 @@ func shrinkstack(gp *g) {
  	newsize := oldsize / 2
  	// Don't shrink the allocation below the minimum-sized stack
  	// allocation.
@@ -751,7 +752,7 @@ index 2d5b87ce2e..1972ed00f1 100644
  		return
  	}
  	// Compute how much of the stack is currently in use and only
-@@ -1348,7 +1370,13 @@ func shrinkstack(gp *g) {
+@@ -1348,7 +1371,13 @@ func shrinkstack(gp *g) {
  	// down to the SP plus the stack guard space that ensures
  	// there's room for nosplit functions.
  	avail := gp.stack.hi - gp.stack.lo
@@ -766,7 +767,7 @@ index 2d5b87ce2e..1972ed00f1 100644
  		return
  	}
  
-@@ -1441,7 +1469,7 @@ func morestackc() {
+@@ -1441,7 +1470,7 @@ func morestackc() {
  // It is a power of 2, and between fixedStack and maxstacksize, inclusive.
  // startingStackSize is updated every GC by tracking the average size of
  // stacks scanned during the GC.
@@ -775,7 +776,7 @@ index 2d5b87ce2e..1972ed00f1 100644
  
  func gcComputeStartingStackSize() {
  	if debug.adaptivestackstart == 0 {
-@@ -1470,14 +1498,14 @@ func gcComputeStartingStackSize() {
+@@ -1470,14 +1499,14 @@ func gcComputeStartingStackSize() {
  		startingStackSize = fixedStack
  		return
  	}
