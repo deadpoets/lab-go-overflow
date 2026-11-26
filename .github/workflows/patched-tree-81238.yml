@@ -20,7 +20,7 @@ on:
         type: boolean
         default: true
       only:
-        description: "If set, run only this runtime test regexp, in a loop (skips the other test steps)"
+        description: "If set, run only this runtime test regexp in a loop, or 'gdbdirect' to run gdb on the TestGdbAutotmpTypes program directly (skips the other test steps)"
         default: ""
       loops:
         description: "Iterations for 'only', each with a 3-minute timeout"
@@ -120,7 +120,7 @@ jobs:
           # exception dispatch, so they are skipped here.
           ..\bin\go.exe test -short -count=1 -skip '^TestGdb' runtime
       - name: isolated test loop
-        if: ${{ !cancelled() && steps.build.outcome == 'success' && inputs.only != '' }}
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && inputs.only != '' && inputs.only != 'gdbdirect' }}
         env:
           ONLY: ${{ inputs.only }}
           LOOPS: ${{ inputs.loops }}
@@ -141,3 +141,39 @@ jobs:
             else { $fail++; "iter $i FAIL $secs s"; $out.Substring([Math]::Max(0, $out.Length - 1500)) }
           }
           "RESULT only=$env:ONLY pass=$pass fail=$fail hang=$hang"
+      - name: gdb direct loop
+        # TestGdbAutotmpTypes's program and gdb command line, run outside the
+        # test harness so a hang shows how far gdb got. amd64 only: the
+        # image's gdb is x86.
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && inputs.only == 'gdbdirect' && matrix.os != 'windows-11-arm' }}
+        env:
+          LOOPS: ${{ inputs.loops }}
+        run: |
+          $goroot = (Resolve-Path go).Path
+          cd gdbprobe
+          $env:GOTOOLCHAIN = 'local'
+          & "$goroot\bin\go.exe" build '-gcflags=all=-N -l' -o a.exe .
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          gdb --version | Select-Object -First 1
+          $exe = (Resolve-Path a.exe).Path
+          $gdbargs = "-nx -batch -iex `"add-auto-load-safe-path $goroot\src\runtime`" -ex `"set startup-with-shell off`" -ex `"set scheduler-locking off`" -ex `"break main.main`" -ex run -ex step -ex `"info types astruct`" `"$exe`""
+          $pass = 0; $fail = 0; $hang = 0
+          for ($i = 1; $i -le [int]$env:LOOPS; $i++) {
+            $o = Join-Path $env:RUNNER_TEMP "gdb-$i.out"; $e = Join-Path $env:RUNNER_TEMP "gdb-$i.err"
+            $t0 = Get-Date
+            $p = Start-Process gdb -ArgumentList $gdbargs -RedirectStandardOutput $o -RedirectStandardError $e -PassThru -NoNewWindow
+            $done = $p.WaitForExit(60000)
+            $secs = [int]((Get-Date) - $t0).TotalSeconds
+            if (-not $done) {
+              $hang++
+              "iter $i HANG after $secs s"
+              $a = Get-Process -Name a -ErrorAction SilentlyContinue
+              if ($a) { $c1 = $a.CPU; Start-Sleep 3; $a.Refresh(); "  debuggee alive, threads=$($a.Threads.Count), cpu $c1 -> $($a.CPU) s" } else { "  debuggee not running" }
+              "  --- gdb stdout"; Get-Content $o -Tail 25
+              "  --- gdb stderr"; Get-Content $e -Tail 10
+              Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+              Get-Process -Name a -ErrorAction SilentlyContinue | Stop-Process -Force
+            } elseif ((Get-Content $o -Raw) -match 'map<string,main.astruct>') { $pass++ }
+            else { $fail++; "iter $i FAIL $secs s exit $($p.ExitCode)"; Get-Content $o -Tail 15; Get-Content $e -Tail 5 }
+          }
+          "RESULT gdbdirect pass=$pass fail=$fail hang=$hang"
