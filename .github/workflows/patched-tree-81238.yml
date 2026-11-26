@@ -67,6 +67,27 @@ jobs:
           git apply --stat $p
           git apply $p
           if ($LASTEXITCODE -ne 0) { exit 1 }
+      - name: native arm64 C toolchain
+        # The image's gcc targets x86, so cgo and DLL tests cannot build on
+        # arm64. Pinned llvm-mingw release, checked against its published
+        # SHA-256, put first on PATH as gcc.
+        if: ${{ matrix.os == 'windows-11-arm' }}
+        run: |
+          $v = '20261117'
+          $zip = Join-Path $env:RUNNER_TEMP 'llvm-mingw.zip'
+          Invoke-WebRequest -Uri "https://github.com/mstorsjo/llvm-mingw/releases/download/$v/llvm-mingw-$v-ucrt-aarch64.zip" -OutFile $zip
+          $h = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower()
+          if ($h -ne 'c7f56de1d7aca15196c19083a799205390397b8b87a825aec3485e1e4f3c2cdd') { throw "llvm-mingw checksum mismatch: $h" }
+          Expand-Archive -LiteralPath $zip -DestinationPath $env:RUNNER_TEMP
+          $bin = Join-Path $env:RUNNER_TEMP "llvm-mingw-$v-ucrt-aarch64/bin"
+          Get-ChildItem $bin -Filter '*gcc*.exe' | Select-Object -ExpandProperty Name
+          if (-not (Test-Path (Join-Path $bin 'gcc.exe'))) { Copy-Item (Join-Path $bin 'aarch64-w64-mingw32-gcc.exe') (Join-Path $bin 'gcc.exe') }
+          if (-not (Test-Path (Join-Path $bin 'g++.exe'))) { Copy-Item (Join-Path $bin 'aarch64-w64-mingw32-g++.exe') (Join-Path $bin 'g++.exe') }
+          & (Join-Path $bin 'gcc.exe') --version
+          & (Join-Path $bin 'gcc.exe') -dumpmachine
+          $bin | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          "CC=$(Join-Path $bin 'gcc.exe')" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CXX=$(Join-Path $bin 'g++.exe')" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: make.bat
         id: build
         run: |
@@ -88,4 +109,7 @@ jobs:
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: |
           cd go/src
-          ..\bin\go.exe test -short -count=1 runtime
+          # The gdb tests hang on these images until the 10-minute timeout,
+          # which hides every runtime result after them. They do not touch
+          # exception dispatch, so they are skipped here.
+          ..\bin\go.exe test -short -count=1 -skip '^TestGdb' runtime
