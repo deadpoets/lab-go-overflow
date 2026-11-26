@@ -19,6 +19,12 @@ on:
         description: "Apply patches-81238/ (false = test the base commit as is)"
         type: boolean
         default: true
+      only:
+        description: "If set, run only this runtime test regexp, in a loop (skips the other test steps)"
+        default: ""
+      loops:
+        description: "Iterations for 'only', each with a 3-minute timeout"
+        default: "10"
 
 jobs:
   plan:
@@ -95,21 +101,43 @@ jobs:
           cd go/src
           .\make.bat
       - name: exception reserve tests
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && inputs.only == '' }}
         run: |
           cd go/src
           ..\bin\go.exe test -count=1 -v -run 'Exception|G0Stack|Vectored' runtime
       - name: exception probe under patched runtime
         # amd64 assembly only.
-        if: ${{ !cancelled() && steps.build.outcome == 'success' && matrix.os != 'windows-11-arm' }}
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && matrix.os != 'windows-11-arm' && inputs.only == '' }}
         run: |
           cd excprobe
           ..\go\bin\go.exe run .
       - name: runtime short tests
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && inputs.only == '' }}
         run: |
           cd go/src
           # The gdb tests hang on these images until the 10-minute timeout,
           # which hides every runtime result after them. They do not touch
           # exception dispatch, so they are skipped here.
           ..\bin\go.exe test -short -count=1 -skip '^TestGdb' runtime
+      - name: isolated test loop
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && inputs.only != '' }}
+        env:
+          ONLY: ${{ inputs.only }}
+          LOOPS: ${{ inputs.loops }}
+        run: |
+          $env:GOROOT = (Resolve-Path go).Path
+          $env:PATH = "$env:GOROOT\bin;$env:PATH"
+          cd go/src/runtime
+          ..\..\bin\go.exe test -c -o rt.test.exe .
+          gdb --version | Select-Object -First 1
+          $run = '-test.run=' + $env:ONLY
+          $pass = 0; $fail = 0; $hang = 0
+          for ($i = 1; $i -le [int]$env:LOOPS; $i++) {
+            $t0 = Get-Date
+            $out = & .\rt.test.exe $run '-test.v' '-test.timeout=3m' 2>&1 | Out-String
+            $secs = [int]((Get-Date) - $t0).TotalSeconds
+            if ($out -match 'test timed out') { $hang++; "iter $i HANG after $secs s"; ($out -split "`n" | Select-String -Pattern 'running tests|gdb|exec' | Select-Object -First 12) }
+            elseif ($LASTEXITCODE -eq 0) { $pass++; "iter $i pass $secs s" }
+            else { $fail++; "iter $i FAIL $secs s"; $out.Substring([Math]::Max(0, $out.Length - 1500)) }
+          }
+          "RESULT only=$env:ONLY pass=$pass fail=$fail hang=$hang"
